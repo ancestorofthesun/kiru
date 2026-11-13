@@ -3,7 +3,7 @@ rem ============================================================================
 rem  Kiru - build the Windows app and its installer. Just double-click this file.
 rem
 rem  It does everything by itself:
-rem    1. finds Python 3.10+                       (tells you where to get it if it is missing)
+rem    1. finds Python 3.10 - 3.12                 (tells you where to get it if it is missing)
 rem    2. makes its own build environment          (.venv-build - your Python is left alone)
 rem    3. installs the packages and PyInstaller
 rem    4. gets FFmpeg into vendor\ffmpeg           (copies yours, or downloads it)
@@ -22,24 +22,77 @@ echo.
 echo   Building Kiru for Windows. This takes 5-15 minutes the first time.
 echo.
 
-rem ---------------------------------------------------------------- 1. Python
-set "PY="
-where py >nul 2>&1 && (py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1 && set "PY=py -3")
-if not defined PY (where python >nul 2>&1 && (python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1 && set "PY=python"))
-if not defined PY goto :no_python
-echo   [1/6] Python found.
+rem ---------------------------------------------------------------- 1. Python 3.10, 3.11 or 3.12
+rem Kiru's AI packages (onnxruntime...) have no builds for Python 3.13 and newer yet, so "the newest Python installed" is the
+rem wrong pick. The order:
+rem   a) KIRU_PYTHON, when it is set: the full path of a python.exe. The GitHub workflow sets it. It is used or the build stops.
+rem   b) "python" on PATH
+rem   c) the py launcher, asked for 3.12, then 3.11, then 3.10
+set "PYEXE="
+set "PYARGS="
+if not defined KIRU_PYTHON goto :find_python
+set "PYEXE=%KIRU_PYTHON%"
+call :check_py
+if not defined PYGOOD goto :bad_kiru_python
+echo   [1/6] Python %PYVER% - from KIRU_PYTHON: %KIRU_PYTHON%
+goto :python_ok
 
-rem ---------------------------------------------------------------- 2. build environment
-if not exist ".venv-build\Scripts\python.exe" (
-  echo   [2/6] Making the build environment...
-  %PY% -m venv .venv-build || goto :fail_venv
+:find_python
+set "PYEXE=python"
+call :check_py
+if defined PYGOOD goto :python_found
+set "PYEXE=py"
+set "PYARGS=-3.12"
+call :check_py
+if defined PYGOOD goto :python_found
+set "PYARGS=-3.11"
+call :check_py
+if defined PYGOOD goto :python_found
+set "PYARGS=-3.10"
+call :check_py
+if defined PYGOOD goto :python_found
+goto :no_python
+:python_found
+echo   [1/6] Python %PYVER% found - %PYEXE% %PYARGS%
+:python_ok
+set "BASEVER=%PYVER%"
+
+rem ---------------------------------------------------------------- 2. build environment (.venv-build), made with THAT Python
+rem An environment left over from another Python is thrown away. On GitHub (--ci or KIRU_PYTHON) it is always made fresh.
+if defined CI goto :drop_venv
+if defined KIRU_PYTHON goto :drop_venv
+if not exist ".venv-build\Scripts\python.exe" goto :make_venv
+set "KEEPEXE=%PYEXE%"
+set "KEEPARGS=%PYARGS%"
+set "PYEXE=%CD%\.venv-build\Scripts\python.exe"
+set "PYARGS="
+call :check_py
+set "PYEXE=%KEEPEXE%"
+set "PYARGS=%KEEPARGS%"
+if "%PYVER%"=="%BASEVER%" goto :venv_ready
+:drop_venv
+if exist ".venv-build" rmdir /s /q ".venv-build"
+:make_venv
+echo   [2/6] Making the build environment with Python %BASEVER%...
+if defined KIRU_PYTHON (
+    "%KIRU_PYTHON%" -m venv .venv-build
 ) else (
-  echo   [2/6] Build environment ready.
+    "%PYEXE%" %PYARGS% -m venv .venv-build
 )
+if errorlevel 1 goto :fail_venv
+:venv_ready
 set "VPY=%CD%\.venv-build\Scripts\python.exe"
+if not exist "%VPY%" goto :fail_venv
+rem make sure the environment really is that Python: everything from here on runs with "%VPY%" only
+set "PYEXE=%VPY%"
+set "PYARGS="
+call :check_py
+if not defined PYGOOD goto :wrong_venv
+echo   [2/6] Build environment ready: Python %PYVER% in .venv-build
 
 rem ---------------------------------------------------------------- 3. packages
 echo   [3/6] Installing Kiru's packages and PyInstaller (a few minutes the first time)...
+"%VPY%" -m pip --version
 "%VPY%" -m pip install --upgrade pip --quiet --disable-pip-version-check
 "%VPY%" -m pip install -r requirements.txt pyinstaller pywebview --quiet --disable-pip-version-check || goto :fail_pip
 
@@ -95,6 +148,29 @@ echo   ==========================================================
 if not defined CI pause
 exit /b 0
 
+rem ---- is "%PYEXE%" %PYARGS% a Python 3.10 - 3.12?  sets PYGOOD=1 and PYVER=3.12.x   (only "python -V" is run for this)
+:check_py
+set "PYGOOD="
+set "PYVER="
+set "PYLINE="
+set "PYMAJ="
+set "PYMIN="
+"%PYEXE%" %PYARGS% -V > "%TEMP%\kiru_pyver.txt" 2>&1
+if errorlevel 1 exit /b 0
+set /p PYLINE=<"%TEMP%\kiru_pyver.txt"
+for /f "tokens=2" %%V in ("%PYLINE%") do set "PYVER=%%V"
+if not defined PYVER exit /b 0
+for /f "tokens=1,2 delims=." %%A in ("%PYVER%") do (
+    set "PYMAJ=%%A"
+    set "PYMIN=%%B"
+)
+if not "%PYMAJ%"=="3" exit /b 0
+if not defined PYMIN exit /b 0
+if %PYMIN% LSS 10 exit /b 0
+if %PYMIN% GTR 12 exit /b 0
+set "PYGOOD=1"
+exit /b 0
+
 :find_iscc
 set "ISCC="
 for /f "delims=" %%P in ('where iscc.exe 2^>nul') do if not defined ISCC set "ISCC=%%P"
@@ -103,11 +179,24 @@ if not defined ISCC if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%P
 if not defined ISCC if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 exit /b 0
 
+:bad_kiru_python
+echo.
+echo   [X] KIRU_PYTHON is set to:  %KIRU_PYTHON%
+echo       but that is not a working Python 3.10, 3.11 or 3.12  ^(it answered: %PYLINE%^).
+echo       Point KIRU_PYTHON at the python.exe of one of those versions, or remove it.
+goto :stop
+:wrong_venv
+echo.
+echo   [X] The build environment .venv-build runs Python %PYVER%, not 3.10 - 3.12.
+echo       Delete the .venv-build folder and run this file again.
+goto :stop
 :no_python
 echo.
-echo   [X] Python 3.10 or newer was not found.
+echo   [X] Python 3.10, 3.11 or 3.12 was not found.
 echo.
-echo       Get it from https://www.python.org/downloads/  ^(tick "Add python.exe to PATH" in its installer^),
+echo       Kiru's AI packages are not available for Python 3.13 and newer yet, so one of those three is needed
+echo       ^(it can sit next to a newer Python^). Get 3.12 from https://www.python.org/downloads/release/python-31210/
+echo       ^(tick "Add python.exe to PATH" in its installer^),
 echo       then double-click build_windows.bat again.
 goto :stop
 :fail_venv
@@ -118,7 +207,7 @@ goto :stop
 :fail_pip
 echo.
 echo   [X] A package could not be installed. The lines above name it.
-echo       Most often this is no internet connection, or a Python older than 3.10 / newer than 3.12.
+echo       Most often this is no internet connection.
 goto :stop
 :no_ffmpeg
 echo.
