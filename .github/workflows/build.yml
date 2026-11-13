@@ -1,0 +1,81 @@
+# Builds one installer per system and attaches them to the release:
+#   Windows  KiruSetup.exe          macOS  Kiru-<version>-macOS-<arch>.dmg          Linux  .tar.gz + .AppImage
+# Runs when you push a tag like v1.0.0, or by hand from the Actions tab. Nothing opens a window: the runners are headless.
+name: Build installers
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+      # build_windows.bat does the rest by itself: build environment, packages, FFmpeg into vendor\ffmpeg, PyInstaller (kiru.spec), installer
+      - name: Build
+        shell: cmd
+        run: build_windows.bat --ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kiru-Windows
+          path: dist/installer/*
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: brew install ffmpeg
+      - run: ./build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kiru-macOS
+          path: dist/installer/*
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/*
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: FFmpeg, Qt libraries, appimagetool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libegl1 libxkbcommon-x11-0 libxcb-cursor0 desktop-file-utils
+          sudo curl -sSL -o /usr/local/bin/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          sudo chmod +x /usr/local/bin/appimagetool
+      - run: ./build_linux.sh
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kiru-Linux
+          path: dist/installer/*
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/*
