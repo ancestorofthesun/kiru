@@ -22,61 +22,6 @@
 
 ---
 
-## Features
-
-<table>
-<tr>
-<td width="50%" valign="top">
-
-### 🧬 Template Engine
-Drop in an edit you admire. Kiru reads it frame by frame and hands you its **skeleton**: every cut, how each transition blurs, flashes, zooms or whips, the beat thumps, speed ramps, slow push-ins, the colour look of each part, the on-screen text and its style, even cut-out characters on a backdrop. Motion is **measured with optical flow**, not guessed: a mirror smear and a title whose letters fly apart are recognised from how the pixels actually move. You get placeholders that say **Drop video here**. Fill them and the edit is yours.
-
-</td>
-<td width="50%" valign="top">
-
-### 🥁 Beat Sync
-Load a song and Kiru finds the tempo, the beat grid and the loud hits, then cuts your clips to them. Thumps, flashes, transitions and speed graphs land on the beat, and the preview is the same maths as the export.
-
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-
-### 🎞️ Timeline
-A CapCut-style editor: up to 8 video and 6 audio tracks, keyframes with easing for position / scale / rotation / opacity, Auto-Duck for music under speech, a searchable effects library you drag onto clips, ready-made motion presets, text styles, sound effects, linked audio, and **Clip Style** (outline, rounded corners, drop shadow) for face-cam boxes.
-
-</td>
-<td width="50%" valign="top">
-
-### 🖼️ Image Editor
-A Photopea-style editor: layers, blend modes, clipping masks, AI subject cut-out, a selection brush that snaps to edges, natural recolour, and Photoshop-like **Layer Styles**. **From a picture** turns the text of any poster, thumbnail or screenshot into editable layers with the closest font, and lets you swap logos.
-
-</td>
-</tr>
-</table>
-
-**You can always go back.** One **Undo / Redo** pair in the top bar (`Ctrl+Z` / `Ctrl+Shift+Z`) works in all three editors and covers everything: a clip dropped on a cut, a changed transition, a moved keyframe, a deleted track with all its clips, a brush stroke. **Save Project** (`Ctrl+S`) writes one small `.kiru` file with the Beat Sync edit, the Timeline and the picture you are working on; **Open Project** brings it all back, and a media file that has moved is outlined in red until you point Kiru to it.
-
-**Made to fit you.** **Settings** (the gear at the bottom of the left bar) has three themes (**Dark**, **Light**, **OLED Black**), the performance profile for your PC (Automatic, High-end, Balanced, Low-end), the **language** (English, Svenska, Español, Français, Deutsch, 日本語, 한국어), and your **audio devices**. In the Timeline, **Record Voiceover** records your microphone while the edit plays and drops the take on an audio track. A preview-volume slider sits in the top bar, every colour box opens a quick palette first, and the tutorial is a small floating panel you can close for good.
-
-## Screenshots
-
-| Beat Sync | Timeline |
-|---|---|
-| ![Structure](docs/screenshots/structure-dark.jpg) | ![Timeline effects](docs/screenshots/timeline-library.jpg) |
-| ![Template Lab](docs/screenshots/template-lab.jpg) | ![Clip Style](docs/screenshots/timeline-clipstyle.jpg) |
-
-| Image Editor | From a picture |
-|---|---|
-| ![Layer Style](docs/screenshots/image-layerstyle.jpg) | ![Fonts shown as examples](docs/screenshots/image-fonts.jpg) |
-| ![Edit text in a poster](docs/screenshots/image-textmode.jpg) | ![Chooser](docs/screenshots/image-chooser.jpg) |
-
-| The Assistant | Projects: a moved file is outlined in red |
-|---|---|
-| ![Assistant](docs/screenshots/assistant.jpg) | ![Open Project](docs/screenshots/project-missing.jpg) |
-
-> Screenshots live in `docs/screenshots/`. Replace any file there with your own capture of the same name.
-
 ## Install
 
 Kiru works **offline**. Editing, templates, the Assistant and exporting never need the internet. It is only used for things you click on: downloading a free font, or opening a site to post your video.
@@ -299,21 +244,6 @@ The canvas updates while you drag. Styles work on any layer (picture, cut-out, t
 | **Timeline:** Record Voiceover (button) | Records the microphone chosen in Settings; the take lands on an audio track at the playhead |
 | `F1` | Help for the current step |
 
-## Languages
-
-Kiru's words live in plain JSON files in the **`locales`** folder, one per language:
-
-```json
-{ "name": "Svenska",
-  "strings":  { "Save Project": "Spara projekt", "Clear Timeline": "Rensa tidslinjen" },
-  "patterns": { "Cut {0}": "Klipp {0}", "Delete Track {t}": "Ta bort spår {t}" } }
-```
-
-- Pick the language in **Settings > Language**. The page changes at once, tooltips included.
-- **Anything a file does not have stays in English**, so a file can be partial. The six that ship cover the buttons, menus, panels, tools and the main tooltips (about 550 phrases each); long help texts and hints are still English.
-- To add a language, copy `sv.json`, rename it (`it.json`), change `"name"`, translate the right-hand sides and restart Kiru. To fix a wording, edit the file.
-- The translations are machine-assisted and have not been reviewed by native speakers yet: corrections are very welcome.
-
 ## Privacy
 
 - The server binds to `127.0.0.1` only. It is not reachable from your network.
@@ -350,14 +280,6 @@ fonts/                fonts for the Image Editor (downloaded on a click, or your
 Exports/              finished videos from the export queue
 _temp/                working files (emptied on every start and on close)
 ```
-
-## Contributing
-
-Issues and pull requests are welcome. Keep the UI in `app.py` self-contained (no CDN, no build step) and make sure a preview change has a matching change in the renderer.
-
-## Acknowledgements
-
-Built by Aden. Thanks to the projects Kiru stands on: FFmpeg, Flask, PyWebView, OpenCV, librosa, ONNX Runtime, rembg, RapidOCR, PySceneDetect and Tesseract.
 
 ## Why Kiru is Free & Open Source
 
