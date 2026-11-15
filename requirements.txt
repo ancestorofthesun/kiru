@@ -1,0 +1,16 @@
+# Kiru - Start_Tool.bat installs these for you on Windows.
+flask
+librosa
+pillow
+opencv-contrib-python
+# AI background removal (use onnxruntime-gpu on an NVIDIA card)
+onnxruntime
+# Template Lab extras (optional)
+scenedetect
+pytesseract
+# Image Editor: AI Select Subject (optional)
+rembg
+# Image Editor: text finder for posters (optional; Tesseract is the fallback)
+rapidocr-onnxruntime
+# Desktop window (optional; without it Kiru opens in the browser)
+pywebview
