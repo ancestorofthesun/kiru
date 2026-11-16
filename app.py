@@ -7250,9 +7250,10 @@ def tl_layer(c, W, H, inputs, n_in, chains, li, tag):
         # ---- static size, rotation (fixed or keyframed): rotate about the picture's centre, which itself
         #      swings round the anchor point
         dw, dh = max(2, round(sw0 * cw_f)), max(2, round(sh0 * chh_f))
-        R = int((dw * dw + dh * dh) ** 0.5) + 4 + 2 * bpad
+        R = int((dw * dw + dh * dh) ** 0.5) + 8 + 2 * bpad
         R += R % 2
-        ch += f",scale={dw}:{dh}:flags=bicubic"
+        # a 2 px see-through border first, so the turned edge is blended (smooth) and not a staircase
+        ch += f",scale={dw}:{dh}:flags=bicubic,pad=iw+4:ih+4:2:2:color=black@0"
         A = f"({ROT('t')}*PI/180)"
         ch += f",rotate=a='{A}':ow={R}:oh={R}:c=black@0:bilinear=1"
         if blur > 0:
