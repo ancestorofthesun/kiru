@@ -28,8 +28,17 @@ import sys
 import threading
 import time
 import uuid
+import logging
 import hashlib
 import webbrowser
+
+log = logging.getLogger("kiru")        # everything Kiru says on the console goes through this logger
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stdout or open(os.devnull, "w"))
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 from flask import Flask, Response, jsonify, request, send_file
 
@@ -209,7 +218,7 @@ def janitor_loop():
         time.sleep(JANITOR_INTERVAL_SEC)
         n = purge_old_exports()
         if n:
-            print(f"[cleanup] Removed {n} unsaved export(s) older than 2 hours.")
+            log.info(f"[cleanup] Removed {n} unsaved export(s) older than 2 hours.")
         try:
             mem_sweep()
         except Exception:
@@ -234,7 +243,7 @@ def ai_idle_free(idle=600):
         R["lock"].release()
     import gc
     gc.collect()
-    print("[memory] AI cut-out models unloaded after 10 idle minutes.")
+    log.info("[memory] AI cut-out models unloaded after 10 idle minutes.")
     return True
 
 
@@ -268,10 +277,10 @@ def shutdown_cleanup():
                 proc.kill()
             except Exception:
                 pass
-    print("\n[cleanup] Wiping temp folder...")
+    log.info("\n[cleanup] Wiping temp folder...")
     wipe_temp()
     autosave_clear()                                       # a normal exit: there is nothing to recover
-    print("[cleanup] Done.")
+    log.info("[cleanup] Done.")
 
 
 def install_close_handlers():
@@ -308,7 +317,7 @@ def install_close_handlers():
             ctypes.windll.kernel32.SetConsoleCtrlHandler(
                 install_close_handlers._win_handler, True)
         except Exception as e:  # never block startup over this
-            print(f"[warn] Could not hook console close event: {e}")
+            log.info(f"[warn] Could not hook console close event: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +447,7 @@ def warm_up_librosa():
     try:
         get_librosa()
     except Exception as e:
-        print(f"[warn] librosa failed to load: {e}")
+        log.info(f"[warn] librosa failed to load: {e}")
     finally:
         BOOT["warm"] = True
 
@@ -617,7 +626,6 @@ def novelty_bounds(sync, ibi, min_len, half=8):
     n = sync.shape[1]
     if n < 2 * half + 2:
         return []
-    X = sync / (np.linalg.norm(sync, axis=0, keepdims=True) + 1e-9)
     d = np.empty((n, n), dtype=sync.dtype)          # beat-to-beat distances, a block of rows at a time: all at once is features x beats x beats (gigabytes for a long song)
     for r0 in range(0, n, 64):
         d[r0:r0 + 64] = np.linalg.norm(sync[:, r0:r0 + 64, None] - sync[:, None, :], axis=0)
@@ -877,7 +885,7 @@ def make_master(uid, path, info, mode):
                 _rm(path)
                 return out, info2
     except Exception as e:
-        print(f"[clip] Re-wrap failed, using the original as-is: {e}")
+        log.info(f"[clip] Re-wrap failed, using the original as-is: {e}")
     _rm(out)
     return path, info
 
@@ -1539,7 +1547,6 @@ def validate_plan(plan):
             sec["bgr"] = bgr
         lay = s.get("layout")
         _ow, _oh = ORIENTS.get(plan.get("orient"), ORIENTS["landscape"])
-        portrait = _oh > _ow                       # 9:16 and 4:5 stack panes (Split); the wide shapes put them side by side
         if lay in MULTI:                               # (every layout works in every shape: side by side, or stacked)
             panes = []
             npn = 3 if lay == "tri" else 2
@@ -2507,7 +2514,7 @@ def build_video_graph(secs, trans, pulse, frame0=0):
         tm = (sp, L, tin, tout, slow_in, slow_out)
         cv = _cv = s.get("curve")
         # decided on the WHOLE edit (before chunking), so a chunk that starts mid-cut blends the same way
-        blend = _blend = s.get("blend", sp < 0.99 or bool(cv and min(cv["v"]) < 0.99))
+        _blend = s.get("blend", sp < 0.99 or bool(cv and min(cv["v"]) < 0.99))
         multi = s.get("layout") in MULTI
         if multi:
             # Triptych / Duo: panes side by side; Split (9:16): top + bottom. Each pane has its own fill, mirror,
@@ -2820,7 +2827,7 @@ def build_video_graph(secs, trans, pulse, frame0=0):
             if vg:
                 govs_.append(vg)
         except Exception as e:
-            print(f"[visualizer] left out of this render: {e}")
+            log.info(f"[visualizer] left out of this render: {e}")
     if govs_:
         cur = gov_layers(cur, chains, inputs, n_in, govs_, frame0, total, pulse.get("tag") or os.path.join(WORK_DIR, "x"))
     # ...then the thumps act on everything, overlays included (zoom, Flicker / Fade Out, heavy flash)
@@ -3204,8 +3211,7 @@ def _ai_subject_mask(img, key):
     if key in _REFINE_AI:
         return _REFINE_AI[key]
     try:
-        import numpy as np
-        from rembg import new_session, remove
+        from rembg import new_session, remove  # noqa: F401  (only checks that it is installed)
     except Exception:
         return None
     if not ai_model_ready():
@@ -3345,6 +3351,75 @@ def api_img_refine():
     return res
 
 
+@app.post("/api/img/manga_cut")
+def api_img_manga_cut():
+    """Image Editor: Manga Cutout. A manga panel -> its foreground figure and the panel behind it, with OpenCV only (no AI
+    model): the part of the page where the drawing is densest gives a first guess, GrabCut snaps that guess to the lines,
+    and the hole the figure leaves is painted in so the background can move behind it."""
+    f = request.files.get("file")
+    if not f:
+        return err("No image.")
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return err("OpenCV / Pillow are not installed. Close Kiru and start it again with Start_Tool.bat: it installs them.", 500)
+    try:
+        im = Image.open(f.stream).convert("RGBA")
+    except Exception:
+        return err("That picture could not be read.")
+    rgba = np.array(im)
+    rgb, alpha0 = np.ascontiguousarray(rgba[:, :, :3]), rgba[:, :, 3]
+    H, W = rgb.shape[:2]
+    k = min(1.0, 640 / max(W, H))
+    small = cv2.resize(rgb, (max(16, round(W * k)), max(16, round(H * k))), interpolation=cv2.INTER_AREA)
+    h, w = small.shape[:2]
+    g = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    edge = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+    dens = cv2.GaussianBlur(edge, (0, 0), max(3.0, w / 40))
+    dens /= float(dens.max()) + 1e-6
+    yy, xx = np.mgrid[0:h, 0:w]
+    centre = np.exp(-(((xx - w / 2) / (0.45 * w)) ** 2 + ((yy - h * 0.55) / (0.5 * h)) ** 2))      # a figure is rarely pressed into a corner
+    sal = dens * (0.4 + 0.6 * centre)
+    thr = max(0.18, cv2.threshold((sal * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0] / 255)
+    blob = cv2.morphologyEx((sal > thr).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(blob)
+    if n <= 1:
+        return err("Kiru could not find a figure in this panel. Select it by hand (Selection Brush or Lasso) and use Copy to new layer.")
+    core = (lab == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    mask = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
+    mask[cv2.dilate(core, np.ones((15, 15), np.uint8)) > 0] = cv2.GC_PR_FGD
+    mask[cv2.erode(core, np.ones((11, 11), np.uint8)) > 0] = cv2.GC_FGD
+    b = max(2, int(0.02 * min(w, h)))
+    mask[:b] = mask[-b:] = cv2.GC_BGD
+    mask[:, :b] = mask[:, -b:] = cv2.GC_BGD
+    engine = "OpenCV GrabCut"
+    try:
+        cv2.grabCut(small, mask, None, np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64), 4, cv2.GC_INIT_WITH_MASK)
+        fg = ((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD)).astype(np.uint8)
+    except cv2.error:
+        fg = np.zeros((h, w), np.uint8)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(fg)
+    if n2 > 1:
+        fg = (lab2 == 1 + int(np.argmax(st2[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    cover = float(fg.mean())
+    if cover < 0.02 or cover > 0.9:                       # GrabCut gave up (flat page, or it took everything): the dense area itself
+        fg, engine = cv2.dilate(core, np.ones((7, 7), np.uint8)), "OpenCV threshold"
+        cover = float(fg.mean())
+    cnt, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(fg, cnt, -1, 1, -1)                  # (holes inside the figure belong to it)
+    a_full = cv2.GaussianBlur(cv2.resize(fg * 255, (W, H), interpolation=cv2.INTER_LINEAR), (0, 0), 1.2)
+    character = np.dstack([rgb, np.minimum(a_full, alpha0)])
+    hole = cv2.dilate(fg * 255, np.ones((9, 9), np.uint8))
+    filled = cv2.resize(cv2.inpaint(small, hole, 5, cv2.INPAINT_TELEA), (W, H), interpolation=cv2.INTER_CUBIC)
+    hm = (cv2.GaussianBlur(cv2.resize(hole, (W, H), interpolation=cv2.INTER_LINEAR), (0, 0), 3)[..., None] / 255.0)
+    background = np.dstack([(rgb * (1 - hm) + filled * hm).astype(np.uint8), alpha0])
+    return jsonify({"character": _data_url(Image.fromarray(character, "RGBA")), "background": _data_url(Image.fromarray(background, "RGBA")),
+                    "cover": round(cover, 3), "engine": engine})
+
+
 @app.post("/api/img/subject")
 def api_img_subject():
     """Image Editor: 'Select Subject' / 'Cut out'. Returns the subject mask and the cut-out
@@ -3362,7 +3437,7 @@ def api_img_subject():
     except ImportError:
         return err("Pillow / numpy are not installed. Close the editor and double-click Start_Tool.bat again: it installs them.", 500)
     try:
-        from rembg import new_session, remove
+        from rembg import new_session, remove  # noqa: F401  (only checks that it is installed)
     except Exception:
         return err("The AI cut-out (rembg) is not installed. Close the editor and double-click Start_Tool.bat again: it installs it.", 500)
     if not ai_model_ready():
@@ -4576,8 +4651,8 @@ def title_graph(chains, cur, tt, frame0, nloc):
         chains.append(f"{cur}[tgw]overlay={en}[tov1]")
         chains.append(f"[tov1][tgs]overlay={en}[tov2]")
     else:
-        chains.append(f"[tgw]nullsink")
-        chains.append(f"[tgs]nullsink")
+        chains.append("[tgw]nullsink")
+        chains.append("[tgs]nullsink")
         chains.append(f"{cur}null[tov2]")
     # 3D extrusion + face drawn straight onto the video (t = this window's time)
     layers = []
@@ -5029,7 +5104,7 @@ def _run_render(jid):
                 last_err = str(e)
                 _rm(out_path)
                 if enc == "nvenc":
-                    print("[render] NVENC failed, falling back to libx264.")
+                    log.info("[render] NVENC failed, falling back to libx264.")
         job.update(status="error", error=last_err or "FFmpeg failed.")
         keep_debug = True
     except Cancelled:
@@ -5066,7 +5141,7 @@ def prepare_polish(po, tag):
     if not has_filter("drawtext"):            # FFmpeg without text support: render everything else
         for key in ("title", "wm"):
             if (po.get(key) or {}).get("on"):
-                print(f"[render] this FFmpeg has no drawtext filter - skipping the {key}.")
+                log.info(f"[render] this FFmpeg has no drawtext filter - skipping the {key}.")
                 po[key]["on"] = False
     rel = lambda path: os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
     for key, fonts in (("title", None), ("wm", WM_FONT)):
@@ -5091,7 +5166,7 @@ def prepare_polish(po, tag):
                 x, y = wm_place(d, tw, th)
                 d.update(png=rel(png), px=x - bx, py=y - by)
             except ImportError:
-                print("[render] Pillow is not installed - plain watermark (no glow).")
+                log.info("[render] Pillow is not installed - plain watermark (no glow).")
 
 
 def _rm(path):
@@ -5417,6 +5492,36 @@ def api_ready():
     """The page tells the engine that its loading screen has faded and the editor is showing."""
     start_warmups(1.5)
     return jsonify(ok=True)
+
+
+@app.post("/api/mem/release")
+def api_mem_release():
+    """A tab was closed, or the Image Editor was left: what that page had running is stopped (a template analysis, a
+    tracking job, an export that was still on its screen) and the AI cut-out models are dropped from memory. They load
+    again by themselves when they are next needed. Exports that run in the background queue are not touched."""
+    d = request.get_json(silent=True, force=True) or {}
+    stopped = 0
+    for key, table in (("render", JOBS), ("tpl", TPL_JOBS), ("track", TRACK_JOBS)):
+        j = table.get(d.get(key)) if isinstance(d.get(key), str) else None
+        if j and not j.get("cancel") and j.get("status") not in ("done", "error", "cancelled"):
+            j["cancel"] = True
+            p = j.get("proc")
+            try:
+                if p and p.poll() is None:
+                    p.kill()
+            except Exception:
+                pass
+            stopped += 1
+    models = False
+    if d.get("models"):
+        try:
+            models = bool(ai_idle_free(0))
+            _REFINE_AI.clear()
+        except Exception:
+            pass
+    import gc
+    gc.collect()
+    return jsonify({"ok": True, "stopped": stopped, "models": models})
 
 
 @app.post("/api/cache/purge")
@@ -6305,16 +6410,16 @@ _PROV_NAME = {"CUDAExecutionProvider": "GPU (CUDA)", "DmlExecutionProvider": "GP
 
 def _cpu_fallback(reason, report=None):
     AI_STATE.update(provider="CPUExecutionProvider", fallback=True, reason=reason)
-    print("\n  [!] ============================================================")
-    print("  [!] The GPU AI could not start - AI is running on the CPU (slow).")
-    print(f"  [!] Reason: {reason[:600]}")
+    log.info("\n  [!] ============================================================")
+    log.info("  [!] The GPU AI could not start - AI is running on the CPU (slow).")
+    log.info(f"  [!] Reason: {reason[:600]}")
     if report:
-        print("  [!] ---- GPU test report ----")
+        log.info("  [!] ---- GPU test report ----")
         for l in report.splitlines()[-40:]:
-            print("  [!] " + l)
-    print(f"  [!] Full report: {os.path.join(AI_DIR, 'gpu_check.log')}")
-    print("  [!] Fix: close the editor and run Start_Tool.bat (or Start_Tool.bat --repair-gpu),")
-    print("  [!]      and keep the NVIDIA driver up to date.")
+            log.info("  [!] " + l)
+    log.info(f"  [!] Full report: {os.path.join(AI_DIR, 'gpu_check.log')}")
+    log.info("  [!] Fix: close the editor and run Start_Tool.bat (or Start_Tool.bat --repair-gpu),")
+    log.info("  [!]      and keep the NVIDIA driver up to date.")
     print("  [!] ============================================================\n", flush=True)
 
 
@@ -6331,7 +6436,7 @@ def ai_provider():
         if os.path.isfile(fc):                              # Start_Tool.bat switched the GPU off after its test crashed
             AI_STATE.update(provider="CPUExecutionProvider", fallback=True, forced=True,
                             reason="GPU switched off by Start_Tool.bat after the GPU test crashed (ai_models\\gpu_force_cpu.txt)")
-            print("  [i] AI background removal runs on the CPU: the GPU was switched off after its test crashed with every ONNX Runtime version.")
+            log.info("  [i] AI background removal runs on the CPU: the GPU was switched off after its test crashed with every ONNX Runtime version.")
             print("      Start_Tool.bat --repair-gpu tries the GPU again.", flush=True)
             return AI_STATE["provider"]
         try:
@@ -9412,7 +9517,6 @@ def _tpl_ease(speeds):
 
 def _tpl_slide(f, A, B, denom):
     """Is frame f 'A pushed out by B'? Try every offset in the four directions; returns (direction, progress 0..1, error)."""
-    import numpy as np
     h, w = f.shape[:2]
     best = (None, 0.0, 1e9)
     for d in ("left", "right", "up", "down"):
@@ -9460,8 +9564,6 @@ def _tpl_classify(frames, gray, sc, luma, a, b, hard, win):
     soft = min(mids) < 0.35 * ref_
     bright = float(lum.max()) > 185 and float(lum.max()) - min(pre, post) > 30
     if span >= 3 and ((out.get("flash") and float(lum.max()) > 232) or (soft and bright)):
-        if os.environ.get("KIRU_TPL_DEBUG"):
-            print("   flash", a, b, [round(m_ / ref_, 2) for m_ in mids], [int(luma[i]) for i in range(a, b + 1)])
         return dict(out, type="bflash" if soft else "flashw", frames=min(30, span + span % 2), confidence=0.8, ease="linear", flash=False)
     A, B = frames[a - 2].astype(np.float32), frames[min(n - 1, b + 2)].astype(np.float32)
     D = B - A
@@ -9573,7 +9675,6 @@ def _tpl_new_types(frames, f, a, b, n, lim=None):
     abin = np.minimum(23, (ang / (2 * np.pi) * 24).astype(np.int32))
     rows, votes = [], {}
     vote = lambda t, c: votes.__setitem__(t, max(votes.get(t, 0), c))
-    span = hi - lo + 1
     for k in range(lo, hi + 1):
         F8 = frames[k]
         F = cv2.GaussianBlur(F8, (0, 0), 0.8).astype(np.float32)
@@ -9862,8 +9963,6 @@ def _tpl_verify(path, dur, events, n, luma, job, protect=(), frames=None):
                         ok_far = True
             if not ok_far:
                 best, static = None, False
-        if os.environ.get("KIRU_TPL_DEBUG"):
-            print("   verify", c, a, b, ti["type"], "best", best and (best["moving"], best["cover"], round(best["scale"], 3)), "static", static)
         if best is None and not static:
             keep.append(e)                               # a different picture: a real cut
             continue
@@ -10520,7 +10619,6 @@ def _tpl_text_scatter(path, x, src_fps, total):
 def _tpl_bg_masks(fr):
     """One small frame -> (backdrop mask, dark mask): the flat, light, colourless studio backdrop and the near-black parts."""
     import cv2
-    import numpy as np
     hsv = cv2.cvtColor(fr, cv2.COLOR_BGR2HSV)
     return (hsv[..., 1] < 46) & (hsv[..., 2] > 120), hsv[..., 2] < 62
 
@@ -11578,7 +11676,6 @@ def _tpl_text_weight(path, dur, text, job):
         ink, patch, light = got
         H = G.shape[0]
         dist = cv2.distanceTransform(ink, cv2.DIST_L2, 3)
-        ys = np.nonzero(ink.any(axis=1))[0]
         cap = max(4.0, float(x.get("line_height", x.get("height", 0.05)) * H))
         stroke = 2.0 * float(np.percentile(dist[ink > 0], 80)) if (ink > 0).any() else 0.0
         ratio = stroke / cap
@@ -11931,7 +12028,6 @@ def analyze_reference(path, name, job):
                 events.append((i + 7, i, i + 13, {"type": "fade", "frames": nt["frames"], "ease": "smooth", "confidence": 0.4}))    # (what it looks like is suggested below, and you confirm it)
 
     events.sort(key=lambda e: e[0])
-    hints = [dict(e[3]) for e in events]                # (what the grouping of busy frames suggested; pass 3 decides)
     R["cuts"] = [round(e[0] / TPL_FPS, 4) for e in events]
     _tfound(job, f"{len(events)} cuts ({found_cuts - len(events0)} that only looked like cuts were dropped)")
 
@@ -12026,7 +12122,6 @@ def analyze_reference(path, name, job):
     for k_e, (c_e, a_e, b_e, ti_e) in enumerate(events):
         ti_e = dict(ti_e)
         ti_e["stack"] = _tpl_stack(ti_e, series[k_e])
-        lum_ = series[k_e]["lum"]
         if any(p_["kind"] == "flash" for p_ in ti_e["stack"]) and ti_e.get("type") not in ("flashw", "bflash"):
             ti_e["flash"] = True                        # a flash stacked on the motion
         ti_e["compound"] = len([p_ for p_ in ti_e["stack"] if p_["kind"] in ("slide", "zoom", "spin")]) >= 2 or (len(ti_e["stack"]) >= 3)
@@ -14349,6 +14444,7 @@ body.booting > :not(#boot){visibility:hidden}
     <div class="transport">
       <button id="btn-play" class="btn icon" title="Play / pause (Space)">&#9654;</button>
       <button id="btn-recmo" class="btn sm" title="Record Motion (R): the selected cut plays and you drag (move), scroll (scale) and Shift+drag (turn) its picture in the preview; Kiru writes what you do as keyframes. R again pauses; R later resumes from the playhead."><span class="vo-dot"></span><span id="btn-recmo-lab">Record Motion</span></button>
+      <button id="btn-bsq" class="btn sm flowtog" title="Preview quality. ON: the Beat Sync preview is drawn with a quarter of the pixels, so heavy cuts (effects, overlays, 4K clips) play smoothly on any PC. OFF: the normal preview. The export is always full quality.">&frac14; preview</button>
       <span id="tc" class="tc"><b>0:00.0</b> / 0:00.0</span>
       <button id="btn-mka" class="btn sm" title="Start the edit exactly where the playhead is (I)">&#8676; Mark Start</button>
       <button id="btn-mkb" class="btn sm" title="End the edit exactly where the playhead is (O)">Mark End &#8677;</button>
@@ -14367,7 +14463,7 @@ body.booting > :not(#boot){visibility:hidden}
     <canvas id="detail"></canvas>
     <div class="tl-bar"><div class="hscroll" id="det-scroll" title="Drag the handle to scroll the timeline, or click to jump"><div id="det-scroll-in"></div></div>
       <span class="sub">Zoom</span><input type="range" id="det-zoom" min="0" max="100" step="1" value="0" title="Zoom the timeline (or Ctrl + scroll)"></div>
-    <div class="hint"><span id="hint"></span><div class="spacer"></div><button id="btn-fit" class="link">Zoom out to whole selection</button></div>
+    <div class="hint"><span id="hint"></span><div class="spacer"></div><button id="btn-ripple" class="btn sm flowtog" title="Ripple. ON: dragging a cut pushes every later cut along, so the cut before it gets longer / shorter and the whole edit with it. OFF: the cut is trimmed against its neighbour and nothing else moves. Hold Alt while dragging for the other one.">&#8646; Ripple</button><button id="btn-fit" class="link">Zoom out to whole selection</button></div>
     </div>
   </section>
 
@@ -15109,6 +15205,7 @@ body.booting > :not(#boot){visibility:hidden}
   <aside class="im-side">
     <div class="im-scroll" id="im-scroll">
       <details class="adv" id="im-sec-sel" open><summary>Selection &amp; AI mask <span class="tagc hidden" id="im-sel-tag">active</span></summary><div class="advbody">
+        <div class="row wrap"><button class="btn sm" id="im-manga" title="Manga Cutout: splits a manga panel into two layers, the character in front and the panel behind it (the gap the character leaves is painted in). Works on the selected picture layer. OpenCV on this PC, no AI model needed.">&#9986; Manga Cutout</button><button class="btn sm" id="im-parallax" title="Parallax: sends the character and the background to the Timeline as two layers with a slow 3D pop-out already keyframed (the background drifts slowly, the character moves a little faster and comes towards you).">&#9707; Parallax</button></div>
         <div class="row wrap"><button class="btn sm primary" id="im-subject">&#10024; Select Subject</button><button class="btn sm" id="im-cutout">&#9986; Cut out subject</button><button class="btn sm" id="im-refine-go" title="Missed an arm or hair? Scribble green over it (keep) or red (remove) and the cut snaps to the edge">&#9998; Refine edges</button></div>
         <div class="bigrow vrow"><label class="switch"><input type="checkbox" id="im-ol-on"><span></span></label><span><b>White outline on the cut-out</b></span></div>
         <div class="srow"><span class="sl">Outline</span><input type="range" id="im-ol-px" min="1" max="3" step="1" value="2"><span class="val" id="im-ol-px-v">2px</span></div>
@@ -15535,6 +15632,7 @@ if (KFRAME) {
 (function () {          // settings kept in a file next to the program: put back whatever this window's own store has lost
   try { const ls = (window.KIRU_SETTINGS || {}).ls || {}; for (const k in ls) if (localStorage.getItem(k) == null && typeof ls[k] === 'string') localStorage.setItem(k, ls[k]); } catch (e) {}
 })();
+const BSQ = { on: (() => { try { return localStorage.getItem('kiru.bsq') === '1'; } catch (e) { return false; } })() };      // Beat Sync: the 1/4 preview
 let ACC = '#6ef0d0', ACC_RGB = '110,240,208';      // the accent the canvases draw with (follows the theme)
 const FPS = 30, PULSE_FRAMES = 7, FLASH_FRAMES = 2, PULSE_ZOOM = 0.07, HEAVY_ZOOM = 0.10;
 const MIN_RANGE = 2.0;      // seconds
@@ -15547,7 +15645,7 @@ const LABELS = ['Intro', 'Verse', 'Pre-Chorus', 'Build', 'Chorus', 'Drop', 'Brea
 const RATES = [['1/4', '¼ beat', '4 cuts per beat'], ['1/2', '½ beat', '2 cuts per beat'], ['1', 'Every beat', '1 cut per beat'],
                ['h2', 'Hold 2', 'cut every 2 beats'], ['h3', 'Hold 3', 'cut every 3 beats'], ['h4', 'Hold 4', 'cut every 4 beats'],
                ['heavy', 'Heavy only', 'strong beats only']];
-const RATE_NAME = Object.fromEntries(RATES.map(r => [r[0], r[1]]));
+const RATE_NAME = Object.fromEntries(RATES.map(r => [r[0], r[1]])); RATE_NAME.manual = 'Hand-placed';
 const TRANS = [['none', '\u2298 Cut'], ['left', '\u2190 Slide left'], ['right', '\u2192 Slide right'], ['up', '\u2191 Slide up'], ['down', '\u2193 Slide down'],
                ['spin', '\u27f3 Spin'], ['zoomin', '\u2295 Zoom in'], ['zoomout', '\u2296 Zoom out'], ['glitch', '\u25a6 Glitch'], ['slowmo', '\u25ce Slow-mo zoom'], ['slowin', '\u25ce Slow-mo zoom in'], ['slowout', '\u25ce Slow-mo zoom out'],
                ['circle', '\u25ef Circle open'], ['pixel', '\u25a9 Pixelate'], ['punch', '\u2734 Punch / Zoom punch'], ['zsync', '\u26a1 Zoom punch sync'],
@@ -16277,6 +16375,27 @@ function addCut(m, t) {
   let id; do id = 'a' + (++addSeq); while (S.macros.some(x => x.edits.added.some(a => a.id === id)));
   cutEdit(() => { m.edits.added.push({ id, t }); rebuild(); });
 }
+/* Ripple Extend: dragging a cut with Ripple on makes the cut before it longer / shorter and pushes every later cut along, so nothing
+   is overwritten and the edit gets longer / shorter. From the dragged section on, the cuts become hand-placed (they no longer sit on
+   the beat grid), each keeps its clip, transition and effects. -> the shift that was really applied (s) */
+const RIP = { on: (() => { try { return localStorage.getItem('kiru.ripple') !== '0'; } catch (e) { return true; } })(), t: null };
+function rippleRekey(old, nw) {
+  if (old === nw) return; if (old in S.cut) { S.cut[nw] = S.cut[old]; delete S.cut[old]; }
+  for (const D of [S.trans, S.topt, S.tflash]) for (const k of Object.keys(D || {})) { const [a, b] = k.split('>'); if (a === old || b === old) { D[(a === old ? nw : a) + '>' + (b === old ? nw : b)] = D[k]; delete D[k]; } }
+  if (S.selCut === old) S.selCut = nw;
+}
+function rippleCut(mi, gid, d) {
+  const m = S.macros[mi], cuts = cutsOf(m), k = cuts.findIndex(c => c.gid === gid); if (k < 1) return 0;
+  const tc = cuts[k].t; d = clamp(d, cuts[k - 1].t + 2 / FPS - tc, S.an.b0 - S.b); if (Math.abs(d) < 0.5 / FPS) return 0;
+  let newGid = gid;
+  for (let j = mi; j < S.macros.length; j++) { const M = S.macros[j], E = M.edits;
+    for (const c of cutsOf(M)) { if (c.gid === 'start') continue; const sh = j > mi || c.t >= tc - 1e-6 ? d : 0;
+      if (c.added) { const a = E.added.find(a => a.id === c.gid); if (a) a.t = c.t + sh; continue; }
+      let id; do id = 'a' + (++addSeq); while (S.macros.some(x => x.edits.added.some(a => a.id === id)));
+      E.added.push({ id, t: c.t + sh }); rippleRekey(M.id + ':' + c.gid, M.id + ':' + id); if (j === mi && c.gid === gid) newGid = id; }
+    E.removed = []; E.moved = {}; M.rate = 'manual'; if (j > mi) M.start += d; M.end += d; }
+  S.b += d; rebuild(); RIP.t = tc + d; return { d, gid: newGid };
+}
 function moveCut(m, gid, t) {
   cutEditBegin(true);
   if (gid[0] === 'a') { const a = m.edits.added.find(a => a.id === gid); if (a) a.t = t; }
@@ -16310,6 +16429,10 @@ function setPhase(p, quiet) {
   updateRenderBtn();
 }
 $('#btn-continue').onclick = () => setPhase('clips');
+$('#btn-ripple').classList.toggle('on', RIP.on); $('#btn-bsq').classList.toggle('on', BSQ.on);
+$('#btn-bsq').onclick = () => { BSQ.on = !BSQ.on; try { localStorage.setItem('kiru.bsq', BSQ.on ? '1' : '0'); } catch (e) {} $('#btn-bsq').classList.toggle('on', BSQ.on); setOrient(S.orient);
+  toast(BSQ.on ? '<b>&frac14; preview on.</b> The preview uses a quarter of the pixels so it keeps up. The export is unchanged.' : '&frac14; preview off: the normal preview.', 'ok'); };
+$('#btn-ripple').onclick = () => { RIP.on = !RIP.on; try { localStorage.setItem('kiru.ripple', RIP.on ? '1' : '0'); } catch (e) {} $('#btn-ripple').classList.toggle('on', RIP.on); toast(RIP.on ? '<b>Ripple on.</b> Dragging a cut pushes the later cuts along; the edit gets longer or shorter.' : '<b>Ripple off.</b> Dragging a cut trims it against its neighbour; nothing else moves.', 'ok'); };
 $('#steps').onclick = e => { const b = e.target.closest('button'); if (!b || b.disabled) return; const st = b.dataset.step === 'polish' && S.phase !== 'overlays' && S.phase !== 'polish' ? 'overlays' : b.dataset.step; if (st !== S.phase) setPhase(st); };
 
 /* ----------------------------------------------------------------- the bin */
@@ -16889,7 +17012,9 @@ function moSeries(mo, N, box, FW, FH) {
   }
   /* raw: a move that was MEASURED in a reference video, one value per frame (shift in parts of the frame, scale, degrees):
      "in" sits on the element's first frames, "out" on its last ones. This is how a Custom Transition carries the exact camera path. */
-  if (mo.raw) for (const [ph, R] of [['in', mo.raw.in], ['out', mo.raw.out], ['in', mo.raw.rec]]) { if (!R || !Array.isArray(R.dx)) continue; const m = R.dx.length;       // (rec = Record Motion: the whole cut, from its first frame)
+  if (mo.raw) for (const [ph, R] of [['in', mo.raw.in], ['out', mo.raw.out], ['rec', mo.raw.rec]]) { if (!R || !Array.isArray(R.dx)) continue; const m = R.dx.length;
+    if (ph === 'rec') { for (let k = 0; k < N; k++) { const j = m === N || N < 2 ? Math.min(k, m - 1) : Math.round(k * (m - 1) / (N - 1));          // (a recording made for another length is stretched over this one)
+      dx[k] += (+R.dx[j] || 0) * FW; dy[k] += (+(R.dy || [])[j] || 0) * FH; sc[k] *= clamp(+(R.sc || [])[j] || 1, 0.05, 8); rot[k] += +(R.rot || [])[j] || 0; } continue; }       // (rec = Record Motion: the whole cut, from its first frame)
     for (let j = 0; j < m; j++) { const k = ph === 'in' ? j : N - m + j; if (k < 0 || k >= N) continue;
       dx[k] += (+R.dx[j] || 0) * FW; dy[k] += (+(R.dy || [])[j] || 0) * FH; sc[k] *= clamp(+(R.sc || [])[j] || 1, 0.05, 8); rot[k] += +(R.rot || [])[j] || 0; } }
   return { dx, dy, sc, rot, op, P };
@@ -19075,7 +19200,7 @@ function setOrient(o) {
   S.orient = ASPECTS[o] ? o : 'landscape';
   const P = isVert();
   [OW, OH] = ASPECTS[S.orient];
-  [W, H] = [OW / 2, OH / 2];
+  [W, H] = BSQ.on ? [OW / 4, OH / 4] : [OW / 2, OH / 2];          // (the 1/4 preview: half the width and height of the normal preview)
   stage.width = W; stage.height = H; stage.style.aspectRatio = `${OW} / ${OH}`; stage.classList.toggle('portrait', P);
   document.body.dataset.aspect = S.orient;
   for (const c of [tmpC, tmpC2, tmpC3, cutC, fxT1, fxR, fxG, fxB]) { c.width = W; c.height = H; }
@@ -19169,12 +19294,22 @@ function bsClipKey(k) {
     S.govs.push(n); S.govSel = S.govs.length - 1; renderOverlaysPanel(); toast(k === 'v' ? 'Layer pasted at the playhead.' : 'Layer duplicated.', 'ok'); return true; }
   if (S.phase !== 'clips') return false;
   const s = selSec(), rec = recOf(s);
-  if (k === 'c') { if (!rec) return false; BSCLIP.cut = JSON.stringify(rec); toast(`Cut ${s.cutNo || ''} copied (clip, speed, effects, overlays). Select another cut and press Ctrl+V.`, 'ok'); return true; }
+  const trOf = x => { const pk = x && pairKey(x); return pk ? { t: S.trans[pk] || null, o: S.topt[pk] ? JSON.parse(JSON.stringify(S.topt[pk])) : null, f: !!S.tflash[pk] } : null; };
+  const trPut = (x, tr) => { const pk = x && pairKey(x); if (!pk || !tr) return; if (tr.t) S.trans[pk] = tr.t; else delete S.trans[pk]; if (tr.o) S.topt[pk] = JSON.parse(JSON.stringify(tr.o)); else delete S.topt[pk]; if (tr.f) S.tflash[pk] = true; else delete S.tflash[pk]; };
+  if (k === 'c') { if (!rec) return false; BSCLIP.cut = JSON.stringify(rec); BSCLIP.tr = trOf(s);
+    toast(`Cut ${s.cutNo || ''} copied with its transition and effects. On another cut: <b>Ctrl+V</b> pastes everything (the clip too), <b>Ctrl+Shift+V</b> pastes only the attributes (transition, effects, motion, speed) and keeps that cut's own clip.`, 'ok'); return true; }
+  if (k === 'a') {                                    // Paste Attributes: everything except which clip plays and where it starts
+    if (!BSCLIP.cut || !s) return false; if (!rec) { toast('Put a clip on this cut first, then paste the attributes onto it.', 'bad'); return true; }
+    pushUndo(); const n = JSON.parse(BSCLIP.cut); delete n.cgSeen; if (n.fx && n.fx.censor) delete n.fx.censor.track;
+    for (const key of ['b', 'start', 'tri', 'layout', 'panes', 'duo', 'split']) { if (key in rec) n[key] = rec[key]; else delete n[key]; }
+    S.cut[s.key] = n; trPut(s, BSCLIP.tr); rebuild(); refreshClipUI(); renderBin(); toast(`Attributes pasted onto cut ${s.cutNo || ''}: transition, effects, motion and speed. Its clip stayed.`, 'ok'); return true; }
   let src = BSCLIP.cut, to = s;
   if (k === 'd') { if (!rec) return false; src = JSON.stringify(rec); to = S.sections[S.sections.indexOf(s) + 1]; if (!to) { toast('This is the last cut: there is no next cut to duplicate onto.', 'bad'); return true; } }
   if (!src || !to) return false;
   pushUndo(); const n = JSON.parse(src); n.start = null; delete n.cgSeen; if (n.fx && n.fx.censor) delete n.fx.censor.track;
+  const trSrc = k === 'd' ? trOf(s) : BSCLIP.tr;
   S.cut[to.key] = n; if (k === 'd') { S.selCut = to.key; S.sel = S.sections.indexOf(to); seek(to.start + 0.05); }
+  if (trSrc && (trSrc.t || trSrc.o || trSrc.f)) { trPut(to, trSrc); rebuild(); }
   recalcClips(); refreshClipUI(); renderBin(); toast(k === 'd' ? `Duplicated onto cut ${to.cutNo || ''}.` : `Pasted onto cut ${to.cutNo || ''}.`, 'ok'); return true;
 }
 function markSel(which) {            // the selection's in / out point = the playhead (the playhead itself does not move)
@@ -19202,6 +19337,7 @@ document.addEventListener('keydown', e => {
   }
   { const k = e.key.toLowerCase();
     if ((e.ctrlKey || e.metaKey) && !words && (k === 'z' || k === 'y')) { e.preventDefault(); (k === 'y' || e.shiftKey) ? histRedo() : histUndo(); return; }
+    if ((e.ctrlKey || e.metaKey) && !words && e.shiftKey && k === 'v' && S.an) { if (bsClipKey('a')) { e.preventDefault(); return; } }
     if ((e.ctrlKey || e.metaKey) && !words && !e.shiftKey && (k === 'c' || k === 'v' || k === 'd') && S.an && !String(getSelection()).trim()) { if (bsClipKey(k)) { e.preventDefault(); return; } }
     if (!words && !e.ctrlKey && !e.metaKey && (k === 'delete' || k === 'backspace') && S.phase === 'overlays' && goSel()) { e.preventDefault(); pushUndo(); S.govs.splice(S.govSel, 1); S.govSel = Math.max(0, S.govSel - 1); renderOverlaysPanel(); toast('Layer deleted. Ctrl+Z brings it back.', 'ok'); return; } }
   if (!typing && (e.key === 'ArrowRight' || e.key === ']' || e.key === 'ArrowLeft' || e.key === '[')) {
@@ -19463,8 +19599,13 @@ function dHit(x, y) {
     }
     return best;
   }
-  if (!S.an || S.phase !== 'structure') return null;
+  if (!S.an || (S.phase !== 'structure' && S.phase !== 'clips')) return null;
   const { X } = dGeom();
+  if (S.phase === 'clips') {                       // Clips step: only the cut edges can be grabbed (to ripple / trim them); a click anywhere else picks the cut
+    let best = null, bd = 6; if (y < BAND) return null;
+    S.macros.forEach(m => { for (const c of cutsOf(m)) { if (c.gid === 'start') continue; const d = Math.abs(X(c.t) - x); if (d < bd) { bd = d; best = { type: 'cut', mid: m.id, gid: c.gid, t: c.t }; } } });
+    return best;
+  }
   if (y < BAND) {                                  // name band: section edges are draggable
     for (let i = 1; i < S.macros.length; i++) if (Math.abs(X(S.macros[i].start) - x) < 8) return { type: 'edge', i };
     return null;
@@ -19495,6 +19636,10 @@ det.addEventListener('pointermove', e => {
     else if (h && h.type === 'cut') {
       const m = S.macros[macroIdx(h.mid)], cuts = cutsOf(m), k = cuts.findIndex(c => c.gid === h.gid);
       const lo = (cuts[k - 1] ? cuts[k - 1].t : m.start) + 2 / FPS, hi = (cuts[k + 1] ? cuts[k + 1].t : m.end) - 2 / FPS;
+      if (RIP.on !== e.altKey && k > 0) {                 // Ripple (the button, or Alt for the other way round): the later cuts are pushed along
+        const r = rippleCut(macroIdx(h.mid), h.gid, Math.round((T(x) - cuts[k].t) * FPS) / FPS); if (r) { h.gid = r.gid; dDrag.rip = (dDrag.rip || 0) + r.d; }
+        else if (T(x) - cuts[k].t > 0.2 && S.an.b0 - S.b < 1 / FPS && !dDrag.ripSaid) { dDrag.ripSaid = true; toast('<b>No room to push.</b> The edit already runs to the end of the part of the song you chose. Make the range longer (Structure &gt; End), or switch Ripple off to trim against the next cut.', 'bad'); }
+      } else
       moveCut(m, h.gid, clamp(snapGrid(T(x), e.shiftKey), lo, hi));
     } else if (h && h.type === 'edge') {
       const A = S.macros[h.i - 1], B = S.macros[h.i];
@@ -19519,7 +19664,8 @@ det.addEventListener('pointerdown', e => {
 let lastClick = { t: 0, x: -99 };
 det.addEventListener('pointerup', e => {
   if (!dDrag) return;
-  const d = dDrag; dDrag = null;
+  const d = dDrag; dDrag = null; RIP.t = null;
+  if (d && d.rip) toast(`<b>Ripple:</b> the later cuts moved ${d.rip > 0 ? 'right' : 'left'} by ${Math.abs(d.rip).toFixed(2)} s; the edit is ${d.rip > 0 ? 'longer' : 'shorter'} by that much. Ctrl+Z undoes it.`, 'ok');
   if (d.moved) { if (d.hit && d.hit.type === 'thump') afterThumpEdit(d.hit.t); else renderStructure(); return; }
   const r = det.getBoundingClientRect(), x = e.clientX - r.left, t = dGeom().T(x);
   const now = performance.now(), dbl = now - lastClick.t < 350 && Math.abs(x - lastClick.x) < 6;
@@ -19545,7 +19691,7 @@ det.addEventListener('pointerup', e => {
     return;
   }
   if (S.phase !== 'structure') { selectCutAt(t); return; }
-  if (d.hit && d.hit.type === 'cut') { removeCut(S.macros[macroIdx(d.hit.mid)], d.hit.gid); dHover = null; return; }
+  if (d.hit && d.hit.type === 'cut' && S.phase === 'structure') { removeCut(S.macros[macroIdx(d.hit.mid)], d.hit.gid); dHover = null; return; }
   if (d.hit && d.hit.type === 'ghost') { restoreCut(S.macros[macroIdx(d.hit.mid)], d.hit.gid); dHover = null; return; }
   const mi = macroAt(t);
   if (d.y0 < BAND) { selectMacro(mi, false); return; }
@@ -19759,6 +19905,10 @@ function drawDetail() {
   if (!S.viewFull) { const R2 = S.b - S.a; dctx.fillStyle = `rgba(${ACC_RGB},.8)`; dctx.fillRect((t0 - S.a) / R2 * w, h - 3, Math.max(3, span / R2 * w), 3); }
   drawMarkers(dctx, X, h, w);
   drawPlayhead(dctx, X(S.t), h);
+  if (RIP.t != null && dDrag) {                        // Ripple while dragging: everything right of the dragged cut is lit, it is being pushed
+    const xr = Math.max(0, X(RIP.t)); dctx.save(); const g = dctx.createLinearGradient(xr, 0, w, 0); g.addColorStop(0, `rgba(${ACC_RGB},.34)`); g.addColorStop(1, `rgba(${ACC_RGB},.10)`);
+    dctx.fillStyle = g; dctx.fillRect(xr, 0, w - xr, h); dctx.fillStyle = ACC; dctx.fillRect(xr - 1, 0, 3, h);
+    dctx.font = '700 12px Inter, system-ui, sans-serif'; dctx.textAlign = 'left'; dctx.textBaseline = 'top'; dctx.fillText('RIPPLE  \u00bb\u00bb\u00bb', xr + 8, 6); dctx.restore(); }
 }
 
 /* -------------------------------------------------------------- main loop */
@@ -22962,6 +23112,7 @@ for (const [q, tip] of [['#fill-empty', 'Puts a clip from the bin on every cut t
   ['#ovl-add', 'Float the chosen bin clip over this cut'], ['#tl-queue', 'Add this sequence to the Export Queue'], ['#go-add-text', 'Add a text layer at the playhead']]) {
   const el = document.querySelector(q); if (el && !el.title) el.title = tip; }
 /* ---- built-in templates, written in beats (bpm 120: one beat = 0.5 s) ---- */
+const tplWith = (t, fn) => { if (fn) t.cuts.forEach(fn); return t; };
 function tplBuild(name, aspect, pattern, extra) {
   const ibi = 0.5, cuts = []; let b = 0;
   pattern.forEach(([beats, type, flash], i) => {
@@ -22985,6 +23136,16 @@ const TPL_BUILTIN = [
   tplBuild('Velocity 9:16', 'portrait', [[2], [1, 'zoomin'], [1, 'zoomout'], [2, 'punch'], [1, 'zoomin'], [1, 'none', true], [2, 'zoomout'], [1, 'left'], [1, 'right'], [2, 'flashw'], [2, 'punch']],
     { look: { on: true, contrast: 112, bright: 2, sat: 135, temp: 0, tint: 0, vig: 0 }, pulses: [...Array(16)].map((_, i) => ({ t: i * 0.5, kind: i % 4 === 3 ? 'flicker' : 'zoom', strength: 110 })),
       text: [{ t0: 0.2, t1: 3.6, text: 'your caption', x: 0.5, y: 0.2, height: 0.035, color: '#ffffff', align: 'center', anim: { in: 'typewriter', out: 'fadeout' } }], note: 'A vertical short: zoom cuts, punches and a typed caption.' }),
+  /* manga edits: made for still panels (Image Editor > Manga Cutout / Parallax give you the layers) */
+  tplWith(tplBuild('Manga Impact', 'portrait', [[1], [1], [.5], [.5], [1, 'none', true], [1], [.5], [.5], [.5], [.5], [2, 'none', true], [1], [1], [.5], [.5], [1, 'none', true]],
+    { feel: 'punchy', look: { on: true, contrast: 135, bright: 0, sat: 40, temp: 0, tint: 0, vig: 25 }, pulses: [...Array(26)].map((_, i) => ({ t: i * 0.5, kind: i % 4 === 0 ? 'flicker' : i % 2 ? 'zoom' : 'shake', strength: i % 4 === 0 ? 100 : 125 })),
+      note: 'Fast panel cuts, a heavy screen shake on the off-beats and a white impact flash on every bar. Hard black-and-white grade.' })),
+  tplWith(tplBuild('Manga Chill', 'portrait', [[8], [8, 'fade'], [8, 'fade'], [8, 'fade'], [8, 'dip']],
+    { tf: 12, transition_frames: 12, feel: 'smooth', look: { on: true, contrast: 94, bright: 4, sat: 85, temp: 12, tint: 0, vig: 30 }, note: 'Long panels that drift and push in slowly, soft dissolves, a warm faded grade. Lo-fi.' }), c => { c.kiru = { drift: true }; }),
+  tplWith(tplBuild('Manga Hype', 'portrait', [[2], [2, 'zoomin'], [1], [1], [2, 'left'], [2, 'right'], [1], [1], [4, 'flashw'], [2, 'zoomin'], [2, 'none', true]],
+    { tf: 6, transition_frames: 6, feel: 'punchy', look: { on: true, contrast: 118, bright: 0, sat: 140, temp: -6, tint: 4, vig: 18 }, pulses: [...Array(20)].map((_, i) => ({ t: i * 0.5, kind: 'zoom', strength: i % 4 ? 85 : 130 })),
+      note: 'Speed ramps on the longer panels (fast in, slow, fast out), a cut-out spot over the big panel for a parallax character, a saturated grade.' }),
+    c => { if (c.beats >= 2) c.kiru = { curve: { on: true, v: [2.2, 0.55, 0.55, 2.2], ease: true }, drift: c.beats >= 4 }; if (c.beats >= 4) c.overlays = [{ x: 0.5, y: 0.56, w: 0.52, h: 0.7, cut: true, shadow: true, anim: 'fade' }]; })
 ];
 /* ---- time mapping: template seconds / beats -> this song ---- */
 function tplGrid() {                    // my beat grid from the first beat inside the selection
@@ -23030,7 +23191,7 @@ function tplApply(t, o) {
     for (let n = 0; n < loops; n++) for (const p of t.pulses) {
       const ts = tAt(p.t, n); if (ts < S.a || ts >= S.b - 1 / FPS) continue;
       const id = 'tq' + (k++); m.pedits.added.push({ id, t: ts, h: (p.strength || 100) > 115 });
-      m.pedits.style[id] = { kind: ['zoom', 'flicker', 'fade'].includes(p.kind) ? p.kind : 'zoom', str: clamp(Math.round(p.strength || 100), 10, 200) };
+      m.pedits.style[id] = { kind: ['zoom', 'flicker', 'fade', 'shake', 'spark'].includes(p.kind) ? p.kind : 'zoom', str: clamp(Math.round(p.strength || 100), 10, 200) };
     }
     S.pulse.on = true;
   }
@@ -23061,6 +23222,9 @@ function tplApply(t, o) {
   S.sections.forEach((s, i) => {                       // cut settings a Kiru-made template carries (speed, fill, effects)
     const src = i ? srcOf[s.gid] : 0, k = src != null && t.cuts[src] && t.cuts[src].kiru;
     if (k) S.cut[s.key] = Object.assign({ b: null, fill: S.lastFill, speed: 1, sync: false, start: null }, JSON.parse(JSON.stringify(k)), S.cut[s.key] && S.cut[s.key].mo ? { mo: S.cut[s.key].mo } : {});
+    if (k && k.drift) { const rec = S.cut[s.key], N = Math.max(2, Math.round(s.L)), q = j => j / (N - 1), dir = i % 2 ? -1 : 1; delete rec.drift;      // Constant Drift: a slow push-in and pan for the whole cut, written for its real length
+      rec.mo = Object.assign({}, rec.mo, { raw: Object.assign({}, (rec.mo || {}).raw, { rec: { n: N, dx: Array.from({ length: N }, (_, j) => Math.round(dir * 0.03 * (q(j) - 0.5) * 1e4) / 1e4), dy: Array.from({ length: N }, (_, j) => Math.round(-0.02 * (q(j) - 0.5) * 1e4) / 1e4),
+        sc: Array.from({ length: N }, (_, j) => Math.round((1.06 + 0.10 * q(j)) * 1e4) / 1e4), rot: new Array(N).fill(0) } }) }); }
     const tc = src != null && t.cuts[src];
     if (tc && (tc.backdrop || (tc.overlays || []).length)) {      // a cut-out scene: backdrop picture + "Drop cut-out here" spots
       const rec = S.cut[s.key] = S.cut[s.key] || { b: null, fill: S.lastFill, speed: 1, sync: false, start: null };
@@ -24038,7 +24202,38 @@ const TL_GFX = {                   // drawn here, added to the bin as PNGs (so t
 const TR3_ICON = { cube: 'M4 8l8-4 8 4v8l-8 4-8-4zM4 8l8 4 8-4M12 12v8', flip: 'M12 3v18M9 7L4 9v6l5 2zM15 7l5 2v6l-5 2z', squeeze: 'M4 6v12M20 6v12M7 12h3M14 12h3M9 10l2 2-2 2M15 10l-2 2 2 2',
   radial: 'M12 12V4a8 8 0 11-8 8z', star: 'M12 3l2.600 5.600 6.100.700-4.500 4.200 1.200 6L12 16.500 6.600 19.500l1.200-6L3.300 9.300l6.100-.700z', diamond: 'M12 3l8 9-8 9-8-9z',
   mgspark: 'M12 3v5M12 16v5M3 12h5M16 12h5M6 6l3 3M15 15l3 3M18 6l-3 3M9 15l-3 3', mgstar: 'M12 2l3 6.500 7 .800-5.200 4.800 1.400 7L12 17.500 5.800 21.100l1.400-7L2 9.300l7-.800z', mgleak: 'M7 8a3 3 0 100 .100M11 6l9-2M12 9l8 3M10 12l5 8' };
+/* Manga Motion: presets made for still panels */
+function tlSpeedLines(c) {            // a picture of white speed lines (made here, once per frame size) laid over the clip, jittering every 2 frames
+  const W = tlW(), H = tlH(), S_ = Math.ceil(Math.hypot(W, H) * 1.05), cv = document.createElement('canvas'); cv.width = cv.height = S_; const x = cv.getContext('2d'), R = tlRnd(77), n = 110;
+  x.translate(S_ / 2, S_ / 2); x.fillStyle = '#fff';
+  for (let i = 0; i < n; i++) { const a = (i + R()) / n * Math.PI * 2, w = (0.004 + 0.012 * Math.abs(R())) * Math.PI, r0 = Math.min(W, H) * (0.30 + 0.22 * Math.abs(R())), r1 = S_ / 2;
+    x.beginPath(); x.moveTo(Math.cos(a) * r0, Math.sin(a) * r0); x.lineTo(Math.cos(a - w) * r1, Math.sin(a - w) * r1); x.lineTo(Math.cos(a + w) * r1, Math.sin(a + w) * r1); x.closePath(); x.fill(); }
+  const name = `speed-lines-${W}x${H}.png`, s = c.start, D = c.dur, base = c.track;
+  const place = m => { tlPush(); const V = tlVRows().slice().reverse(), i = V.indexOf(base); let tr = V.slice(i + 1).find(t => !TL.clips.some(q => q.track === t && q.start < s + D && q.start + q.dur > s));
+    if (!tr) { tlSetRows(V.length + 1, TL_ROWS.filter(t => !tlIsV(t)).length); tr = tlVRows()[0]; }
+    tlDropMedia(m.lid, tr, s); const o = TL.clips[TL.clips.length - 1]; o.start = s; o.dur = D; o.track = tr; tlFrameFit(o, 'fill'); const sc = o.p.scale; o.p.opacity = 88;
+    o.kf.rot = []; o.kf.scale = []; for (let k = 0; k < D; k += 2) { const a = Math.round(R() * 180), z = sc * (1 + 0.05 * Math.abs(R())); o.kf.rot.push([k, a], [Math.min(D - 1, k + 1), a]); o.kf.scale.push([k, z], [Math.min(D - 1, k + 1), z]); }
+    tlChanged(); toast('<b>Speed lines</b> are a layer of their own above the clip: move, fade or delete them like any picture.', 'ok'); };
+  const have = TL.media.find(m => m.name === name && m.status === 'ready'); if (have) { place(have); return; }
+  cv.toBlob(async b => { await tlImport([new File([b], name, { type: 'image/png' })]); const t0 = performance.now();
+    const tick = () => { const m = TL.media.find(q => q.name === name); if (m && m.status === 'ready') place(m); else if (performance.now() - t0 < 60000) setTimeout(tick, 150); }; tick(); }, 'image/png');
+}
+function tlImpactFrame(c) {           // two very short Adjustment Layers at the playhead: a white-hot black-and-white frame, then a dark one; the panel punches in
+  const k = tlHere(c), f = c.start + k, mk = (st, d, bri) => { tlSeekF(st); tlAddAdj(); const a = TL.clips[TL.clips.length - 1]; a.start = st; a.dur = d; a.p.sat = -100; a.p.bri = bri; return a; };
+  const keepSel = TL.sel, back = tlFrame(); mk(f, 2, 60); mk(f + 2, 3, -45); tlSeekF(back); TL.sel = keepSel;
+  tlScaleKeys(c, k, k + 8, (q, kk) => kk - k <= 2 ? 1 + 0.12 * (kk - k) / 2 : 1.12 - 0.12 * E_.outCubic((kk - k - 2) / 6));
+}
+Object.assign(TL_PRESETS, {
+  mdrift: ['Constant Drift', 'a slow push-in and pan for the whole clip', 'M4 18l7-7 4 4 5-9M15 6h5v5', c => { const W = tlW(), H = tlH(), st = Math.max(1, Math.ceil(c.dur / 30));
+    tlScaleKeys(c, 0, c.dur - 1, q => 1.05 + 0.11 * q, st); tlPosKeys(c, 0, c.dur - 1, q => [W * 0.03 * (q - 0.5), -H * 0.02 * (q - 0.5)], st); }],
+  mimpact: ['Impact Frame', 'a black-and-white flash and a punch at the playhead', 'M13 2L4 14h7l-1 8 9-12h-7z', c => { tlImpactFrame(c); }],
+  mspeed: ['Speed Lines', 'animated manga speed lines over the clip', 'M12 12L3 4M12 12l9-8M12 12L2 13M12 12l10 1M12 12l-7 9M12 12l7 9', c => { tlSpeedLines(c); }],
+  mshake: ['Panel Shake', 'a violent shake of the whole panel', 'M6 6h12v12H6zM2 8v8M22 8v8M8 2h8M8 22h8', c => { const k = tlHere(c), R = tlRnd(c.start * 17 + k + 3), A = tlW() * 0.05, n = 20;
+    tlPosKeys(c, k, k + n, (q, kk) => kk === k || kk === k + n ? [0, 0] : [R() * 2 * A * (1 - q * 0.8), R() * 2 * A * (1 - q * 0.8)]);
+    tlScaleKeys(c, k, k + n, q => 1.10 - 0.10 * Math.max(0, q - 0.8) / 0.2); tlNumKeys(c, 'rot', k, k + n, (q, b, kk) => kk === k || kk === k + n ? b : b + R() * 3 * (1 - q)); }],
+});
 const TL_LIBG = [
+  ['Manga Motion', 'for manga panels and stills', [['pre', 'mdrift'], ['pre', 'mimpact'], ['pre', 'mspeed'], ['pre', 'mshake']]],
   ['Modern YT', 'one click, editable keyframes', [['pre', 'punch'], ['pre', 'szoom'], ['pre', 'whipl'], ['pre', 'whipr'], ['pre', 'sshake'], ['pre', 'poptext']]],
   ['Transitions', 'drop on a clip: shapes the cut at its start', Object.keys(TL_TRANSI).map(k => ['tr', k]).concat(Object.keys(TR3).filter(k => !TR3_MG.includes(k)).map(k => ['tr3', k]))],
   ['Motion Graphics', 'drop on a clip: plays over the cut at its start', TR3_MG.map(k => ['tr3', k])],
@@ -25560,6 +25755,47 @@ $('#im-tlib-btn').onclick = $('#im-empty-tlib').onclick = imTLibOpen; $('#im-tl-
 $('#im-tlib').addEventListener('pointerdown', e => { if (e.target === e.currentTarget) $('#im-tlib').classList.add('hidden'); });
 $('#im-tl-cats').onclick = e => { const b = e.target.closest('button'); if (!b) return; IM.tlibCat = b.dataset.c; imTLibPaint(); };
 $('#im-tl-grid').onclick = e => { const b = e.target.closest('[data-t]'); if (b) imTLibUse(b.dataset.t); };
+/* ---------------------------------------------------------------- Manga Cutout + Parallax */
+async function imMangaCut() {
+  if (!IM.doc) { imMsg('Open a manga panel first.'); return; }
+  let L = imLayer(); if (!L || L.type !== 'image' || L.ph) L = [...IM.layers].reverse().find(z => z.type === 'image' && z.visible && !z.ph) || null;
+  if (!L) { imMsg('Select the picture layer that holds the panel.'); return; }
+  imEndText(); imBusy('Cutting the character out of the panel…');
+  try { const blob = await new Promise(r => L.cv.toBlob(r, 'image/png')), fd = new FormData(); fd.append('file', blob, 'panel.png');
+    const r = await fetch('/api/img/manga_cut', { method: 'POST', body: fd }), j = await r.json(); if (!r.ok) throw new Error(j.error || 'failed');
+    const [bg, ch] = await Promise.all([imLoadCv(j.background), imLoadCv(j.character)]);
+    imPush(); const i = IM.layers.indexOf(L), base = { x: L.x, y: L.y, sx: L.sx, sy: L.sy, rot: L.rot, kx: L.kx, ky: L.ky };
+    const B = imNewLayer('image', { ...base, name: 'Background (panel)', cv: bg, manga: 'bg' }), C = imNewLayer('image', { ...base, name: 'Character', cv: ch, manga: 'ch' });
+    for (const z of IM.layers) delete z.manga; B.manga = 'bg'; C.manga = 'ch';
+    L.visible = false; L.name = (L.name || 'Panel') + ' (original)'; IM.layers.splice(i + 1, 0, B, C); IM.act = C.id; imChanged();
+    imMsg(`Character and background are two layers now (${j.engine}, the character covers ${Math.round(j.cover * 100)}% of the panel). Not clean? Fix the Character layer with the Eraser or Refine edges, then press Parallax.`);
+  } catch (e) { imMsg(`Manga Cutout: ${e.message}`); }
+  finally { imBusy(null); }
+}
+let imParN = 0;
+async function imParallax() {
+  if (!IM.doc) return; imEndText();
+  let ch = IM.layers.find(z => z.manga === 'ch' && z.visible), bg = IM.layers.find(z => z.manga === 'bg' && z.visible);
+  if (!ch || !bg) { const a = imLayer(), i = IM.layers.indexOf(a); ch = a && a.type === 'image' ? a : null; bg = ch ? IM.layers.slice(0, i).reverse().find(z => z.visible && z.type === 'image') : null; }
+  if (!ch || !bg) { imMsg('Parallax needs two layers: a character in front and a background behind it. Press Manga Cutout first, or select the front layer yourself.'); return; }
+  const one = L => { const keep = IM.layers, pv = IM.prev; IM.layers = [L]; IM.prev = null; try { return imComposite(imCanvas(IM.doc.w, IM.doc.h), false); } finally { IM.layers = keep; IM.prev = pv; } };
+  const file = async (L, nm) => new File([await new Promise(r => one(L).toBlob(r, 'image/png'))], nm, { type: 'image/png' });
+  const n = ++imParN, fb = await file(bg, `parallax-${n}-background.png`), fc = await file(ch, `parallax-${n}-character.png`);
+  setAppMode('timeline'); await tlImport([fb, fc]);
+  const t0 = performance.now(); let mb, mc;
+  while (performance.now() - t0 < 60000) { mb = TL.media.find(m => m.name === fb.name); mc = TL.media.find(m => m.name === fc.name); if (mb && mc && mb.status === 'ready' && mc.status === 'ready') break; await new Promise(r => setTimeout(r, 150)); }
+  if (!mb || !mc || mb.status !== 'ready' || mc.status !== 'ready') { toast('The two layers could not be added to the Timeline.', 'bad'); return; }
+  tlPush(); const D = 4 * FPS, s = tlFrame(), W = tlW(), H = tlH(), V = tlVRows().slice().reverse();          // V: bottom track first
+  const free = tr => !TL.clips.some(c => c.track === tr && c.start < s + D && c.start + c.dur > s);
+  let k = V.findIndex((tr, i) => i + 1 < V.length && free(tr) && free(V[i + 1])), trB, trC;
+  if (k < 0) { tlSetRows(V.length + 2, TL_ROWS.filter(tr => !tlIsV(tr)).length); const V2 = tlVRows().slice().reverse(); trB = V2[V2.length - 2]; trC = V2[V2.length - 1]; } else { trB = V[k]; trC = V[k + 1]; }
+  const put = (m, tr, z0, z1, dx, dy) => { tlDropMedia(m.lid, tr, s); const c = TL.clips[TL.clips.length - 1]; c.start = s; c.dur = D; c.track = tr; tlFrameFit(c, 'fit'); const sc = c.p.scale;
+    c.kf.scale = [[0, Math.round(sc * z0 * 100) / 100], [D - 1, Math.round(sc * z1 * 100) / 100]]; c.kf.pos = [[0, [W / 2 - dx, H / 2 - dy]], [D - 1, [W / 2 + dx, H / 2 + dy]]]; return c; };
+  put(mb, trB, 1.06, 1.10, -W * 0.008, 0); const cc = put(mc, trC, 1.06, 1.19, W * 0.016, -H * 0.006);
+  TL.sel = cc.id; tlChanged(); tlFit();
+  toast('<b>Parallax is on the Timeline.</b> Two layers, 4 seconds: the background drifts slowly, the character moves faster and comes towards you. Stretch both clips to change the length; the keyframes are in Effect Controls.', 'ok');
+}
+$('#im-manga').onclick = imMangaCut; $('#im-parallax').onclick = imParallax;
 async function imTplFromFile(f, mode, labels) {
   if (!f) return; if (labels === undefined && IM.tplFile === f) labels = IM.tplLabels || null;        // (building it again, e.g. after installing fonts: the same marks)
   IM.tplFile = f; IM.tplLabels = labels || null; mode = mode || IM.tplMode || 'full'; IM.tplMode = mode;
@@ -26812,8 +27048,15 @@ async function aiPoll(n) {
 }
 aiPoll(0);
 /* ---------------------------------------------------------------- switching between the three editors */
+function memRelease(o, beacon) {            // tell the engine what this page no longer needs (see /api/mem/release)
+  const body = JSON.stringify(o); try { if (beacon && navigator.sendBeacon) navigator.sendBeacon('/api/mem/release', new Blob([body], { type: 'application/json' }));
+    else fetch('/api/mem/release', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {}); } catch (e) {} }
+window.addEventListener('pagehide', () => {         // the tab is being closed (or Kiru is): stop what only this page was waiting for, free the models
+  if (KNEST) return; let rj = null; try { rj = typeof job === 'string' && job && !$('#overlay').classList.contains('hidden') ? job : null; } catch (e) {}
+  memRelease({ render: rj, tpl: typeof TPL.job === 'string' && TPL.job !== 'up' && TPL.job !== 'x' ? TPL.job : null, track: TRK.job || null, models: true }, true); });
 function setAppMode(m) {
   const tl = m === 'timeline', img = m === 'image';
+  if (document.body.classList.contains('img') && !img) memRelease({ models: true });          // leaving the Image Editor: its AI models can go (they come back on the next cut-out)
   if (tl || img) { if (S.tap) stopTap(); if (S.tapcut) tapCutStop(); if (S.playing) pause(); }
   if (!tl && TL.playing) tlPause();
   if (!tl && document.body.classList.contains('tl')) {            // leaving the Timeline: its video decoders and scratch pictures are let go (they come back on demand)
@@ -27647,14 +27890,14 @@ def open_browser_when_ready():
             webbrowser.open(URL)
             return
         time.sleep(0.2)
-    print(f"[warn] Server didn't respond - open {URL} manually.")
+    log.info(f"[warn] Server didn't respond - open {URL} manually.")
 
 
 def main():
     if _port_open(PORT):
-        print(f"[error] Port {PORT} is already in use.")
-        print("        Is the editor already running in another window?")
-        print(f"        If so, just open {URL}")
+        log.info(f"[error] Port {PORT} is already in use.")
+        log.info("        Is the editor already running in another window?")
+        log.info(f"        If so, just open {URL}")
         sys.exit(1)
 
     wipe_temp()
@@ -27663,11 +27906,11 @@ def main():
     install_close_handlers()
     start_warmups()
 
-    print("\n  Kiru - the open-source AMV maker")
-    print(f"  Temp folder : {TEMP_DIR}  (wiped)")
-    print(f"  Output      : {OUTPUT_W}x{OUTPUT_H} @ {FPS} fps")
-    print(f"  Editor      : {URL}")
-    print("  Close this window (or press Ctrl+C) to stop.\n")
+    log.info("\n  Kiru - the open-source AMV maker")
+    log.info(f"  Temp folder : {TEMP_DIR}  (wiped)")
+    log.info(f"  Output      : {OUTPUT_W}x{OUTPUT_H} @ {FPS} fps")
+    log.info(f"  Editor      : {URL}")
+    log.info("  Close this window (or press Ctrl+C) to stop.\n")
 
     if "--no-browser" not in sys.argv:
         threading.Thread(target=open_browser_when_ready, daemon=True).start()
