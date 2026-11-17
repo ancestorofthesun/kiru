@@ -1,0 +1,38 @@
+# working files (emptied by the app itself)
+_temp/
+_cache/
+_webview/
+# finished videos from the export queue
+Exports/
+# downloaded AI models + GPU test logs
+ai_models/
+ai_model/
+# fonts fetched on a click, or dropped in by you
+fonts/
+# builds
+build/
+dist/
+vendor/
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv-build/
+venv/
+# OS / editors
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+# your settings (theme, language, devices)
+settings.json
+project.kiru_autosave
+recent_projects/
+project_assets/
+clipboard.kiru_clip
+_temp_*/
+project.kiru_autosave_*
+
+# voice-overs you generated, and your cloud voice keys
+Voiceovers/
+voice_keys.json
